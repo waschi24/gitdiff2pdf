@@ -234,3 +234,65 @@ python gitdiff2pdf.py compare.diff -o changed-code.pdf --title "Changed Code (Un
 ```bash
 git diff <a-commit> <b-commit> | python gitdiff2pdf.py - -o diff.pdf --title "Changed Code"
 ```
+## Word
+
+```bash
+pip install python-docx
+```
+
+> **Windows (PowerShell):**
+>
+> ```powershell
+> py -m pip install python-docx
+> ```
+
+### New function: `render_word()`
+A complete Word renderer that mirrors the PDF output:
+
+| Feature | Details |
+|---|---|
+| **File badge** | Blue-background, bold monospace row |
+| **Hunk header** | Blue-background `@@ … @@` row |
+| **Hunk suffix** | Green-background added line (same as PDF) |
+| **Added lines** | Green background + line number gutter |
+| **Removed lines** | Red background + line number gutter |
+| **Context lines** | Grey background + line number gutter |
+| **Side-by-side** | Two-column table per paired row |
+| **Dark/light theme** | Same colour tokens as the PDF |
+| **Font** | Consolas monospace in all code cells |
+
+---
+
+### New CLI flags
+
+| Flag | Meaning |
+|---|---|
+| `--word` | Generate a `.docx` next to the PDF (same base name) |
+| `--word-output FILE.docx` | Generate a `.docx` at a custom path |
+
+---
+
+### Usage examples
+
+```bash
+# PDF only (unchanged behaviour)
+python gitdiff2pdf.py my.diff -o output.pdf
+
+# PDF + Word (auto-named output.docx)
+python gitdiff2pdf.py my.diff -o output.pdf --word
+
+# PDF + Word with a custom docx name
+python gitdiff2pdf.py my.diff -o output.pdf --word-output review.docx
+
+# Word only (still produces the PDF, just ignore it – or redirect to /dev/null)
+python gitdiff2pdf.py my.diff -o /dev/null --word-output review.docx
+
+# Side-by-side + Word
+python gitdiff2pdf.py my.diff -o output.pdf --view side-by-side --word
+
+# Dark theme
+python gitdiff2pdf.py my.diff -o output.pdf --theme dark --word
+```
+
+---
+

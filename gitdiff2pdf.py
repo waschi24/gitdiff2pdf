@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-gitdiff2pdf.py - Generate a PR-like PDF from unified git diffs.
+gitdiff2pdf.py - Generate a PR-like PDF (and optionally Word .docx) from unified git diffs.
 
 Highlights:
 - Unified view (default): '-' red, '+' green, context gray - Bitbucket-like.
@@ -15,6 +15,7 @@ Highlights:
 - Fonts: System fonts (Windows: Consolas/Segoe UI; Linux: DejaVu) with safe fallbacks.
 - Efficient pagination: multiple files/hunks per page, subtle block gaps, widow/orphan protection.
 - Keep-together: per FILE and per HUNK (no splitting if the block fits on a new page).
+- Word output: --word / --word-output path.docx  (requires python-docx).
 """
 
 from __future__ import annotations
@@ -65,7 +66,6 @@ def clean_leading_artifacts(text: str) -> str:
         if t.startswith(p):
             t = t[len(p):].lstrip()
             break
-    # Only replace if we actually removed something; otherwise return original
     if len(t) < len(text):
         return t
     return text
@@ -227,15 +227,15 @@ class Layout:
     margin: float = 44.0
     font_size: float = 9.5
     line_gap: float = 2.2
-    hunk_gap_y: float = 8.0           # extra space after a hunk (below code)
-    section_gap_y: float = 10.0       # extra space after a file badge (if more content follows)
+    hunk_gap_y: float = 8.0
+    section_gap_y: float = 10.0
     col_gap: float = 16.0
     gutter_gap: float = 6.0
     gutter_chars: int = 5
-    gap_badge_to_hunk: float = 2.0    # file badge close to first hunk
-    gap_hunk_to_code: float = 4.0     # small, visible gap from blue header to code (kept minimal as requested)
-    block_gap_y: float = 6.0          # small gap between hunks/files (not cramped)
-    min_rows_on_page: int = 3         # widow/orphan protection: min code rows after header
+    gap_badge_to_hunk: float = 2.0
+    gap_hunk_to_code: float = 4.0
+    block_gap_y: float = 6.0
+    min_rows_on_page: int = 3
 
 
 # -------------------- Diff Model & Parser --------------------
@@ -257,7 +257,7 @@ class Hunk:
     new_start: int
     new_count: int
     lines: List[DiffLine] = field(default_factory=list)
-    suffix: Optional[str] = None      # context/function suffix after @@
+    suffix: Optional[str] = None
 
 
 @dataclass
@@ -267,7 +267,6 @@ class DiffFile:
     hunks: List[Hunk] = field(default_factory=list)
 
 
-# Capture suffix after the second @@ (e.g., " services:")
 HUNK_RE = re.compile(r"@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@(?:(.*))?$")
 
 
@@ -303,7 +302,6 @@ def parse_unified_diff(text: str, tabsize: int, debug: bool = False) -> List[Dif
     for raw in lines:
         line = strip_invisibles(raw.rstrip("\n"))
 
-        # ignore meta
         if (line.startswith("index ")
             or line.startswith("new file mode")
             or line.startswith("deleted file mode")
@@ -358,7 +356,6 @@ def parse_unified_diff(text: str, tabsize: int, debug: bool = False) -> List[Dif
             new_start = int(m.group(3)); new_count = int(m.group(4) or "1")
             suffix = (m.group(5) or "").strip()
 
-            # header without suffix
             header_core = "@@ -{}".format(old_start)
             if m.group(2):
                 header_core += f",{old_count}"
@@ -381,7 +378,6 @@ def parse_unified_diff(text: str, tabsize: int, debug: bool = False) -> List[Dif
         if current_hunk is None:
             continue
 
-        # classify hunk content
         if line.startswith("+") and not line.startswith("+++ "):
             current_hunk.lines.append(DiffLine(kind="add", text=strip_invisibles(line[1:].expandtabs(tabsize)), raw=line))
         elif line.startswith("-") and not line.startswith("--- "):
@@ -396,13 +392,11 @@ def parse_unified_diff(text: str, tabsize: int, debug: bool = False) -> List[Dif
     if not saw_any_hunk:
         return []
 
-    # placeholder paths
     for f in files:
         if not f.old_path and not f.new_path:
             f.old_path = "(Unnamed OLD)"
             f.new_path = "(Unnamed NEW)"
 
-    # assign line numbers per hunk
     for f in files:
         for h in f.hunks:
             old_ln = h.old_start
@@ -447,7 +441,7 @@ def wrap_text(s: str, max_w: float, fontname: str, fontsize: float) -> List[str]
     return out
 
 
-# -------------------- Renderer --------------------
+# -------------------- PDF Renderer --------------------
 
 class Renderer:
     def __init__(self, theme: Theme, layout: Layout, landscape: bool, fonts: Fonts):
@@ -456,18 +450,14 @@ class Renderer:
         self.landscape = landscape
         self.doc = fitz.open()
 
-        # flowing state (efficient page usage)
         self.page: Optional[fitz.Page] = None
         self.y_base: Optional[float] = None
         self.title: Optional[str] = None
 
-        # safe fonts
         self.ui_font   = safe_font(fonts.ui,       fallback="courier")
         self.ui_bold   = safe_font(fonts.ui_bold,  fallback="courier-bold")
         self.mono_font = safe_font(fonts.mono,     fallback="courier")
         self.mono_bold = safe_font(fonts.mono_bold, fallback="courier-bold")
-
-    # ---- Page / Box ----
 
     def new_page(self) -> fitz.Page:
         base = fitz.paper_rect("a4")
@@ -480,12 +470,9 @@ class Renderer:
         return (m, m, page.rect.width - m, page.rect.height - m)
 
     def page_capacity(self) -> float:
-        """Return usable height (points) from first code top on a fresh page."""
         assert self.page is not None
         x0, y0, x1, y1 = self.box(self.page)
-        return y1 - (y0 + 28)  # top-of-code is at y0+28 (baseline y0+28+fs => top = baseline - fs)
-
-    # ---- Header / Footer & Start ----
+        return y1 - (y0 + 28)
 
     def draw_header(self, page: fitz.Page, title: str):
         x0, y0, x1, _ = self.box(page)
@@ -494,7 +481,6 @@ class Renderer:
         stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
         tw = text_width(stamp, self.ui_font, fs)
         page.insert_text((x1 - tw, y0), stamp, fontname=self.ui_font, fontsize=fs, color=self.theme.ui_subtle)
-        # divider
         y = y0 + fs + 2 + fs + 4
         page.draw_line((x0, y - 4), (x1, y - 4), color=self.theme.header_line, width=0.8)
 
@@ -503,7 +489,6 @@ class Renderer:
             self.page = self.new_page()
             self.title = title
             self.draw_header(self.page, title)
-            # first baseline under the header line
             x0, y0, x1, y1 = self.box(self.page)
             fs = self.layout.font_size
             self.y_base = y0 + 28 + fs
@@ -520,17 +505,13 @@ class Renderer:
             tw = text_width(label, self.ui_font, fs)
             page.insert_text(((x0 + x1) / 2 - tw / 2, y1), label, fontname=self.ui_font, fontsize=fs, color=self.theme.ui_subtle)
 
-    # ---- Baseline / Space ----
-
     def space_left(self) -> float:
-        """Remaining height from current row top to page bottom."""
         assert self.page is not None and self.y_base is not None
         _, _, _, y1 = self.box(self.page)
         fs = self.layout.font_size
         return y1 - (self.y_base - fs)
 
     def ensure_y(self, rows_h: float):
-        """Ensure there is room for rows_h (points); otherwise start new page."""
         assert self.page is not None and self.y_base is not None and self.title is not None
         if self.space_left() >= rows_h:
             return
@@ -541,15 +522,11 @@ class Renderer:
         self.y_base = ny0 + 28 + fs
 
     def widow_check_before_hunk(self, line_h: float):
-        """Avoid lone hunk headers at page bottom."""
         needed = line_h + self.layout.gap_hunk_to_code + (self.layout.min_rows_on_page * line_h)
         if self.space_left() < needed:
             self.ensure_y(10_000)
 
-    # ---- Building blocks ----
-
     def draw_file_badge(self, label: str):
-        """File badge aligned to the baseline grid."""
         assert self.page is not None and self.y_base is not None
         x0, _, x1, _ = self.box(self.page)
         fs = self.layout.font_size
@@ -562,12 +539,9 @@ class Renderer:
         rect = fitz.Rect(x0, top, min(x1, x0 + pad_x + tw + 7), bottom)
         self.page.draw_rect(rect, fill=self.theme.bg_hunk, color=None, fill_opacity=0.9)
         self.page.insert_text((x0 + pad_x, self.y_base), label, fontname=self.ui_bold, fontsize=fs, color=self.theme.tx_hunk)
-
-        # close to hunk header
         self.y_base = bottom + self.layout.gap_badge_to_hunk + fs
 
     def draw_hunk_header(self, header: str):
-        """Blue hunk header aligned to the baseline grid (header only: @@ ... @@)."""
         assert self.page is not None and self.y_base is not None
         x0, _, x1, _ = self.box(self.page)
         fs = self.layout.font_size
@@ -579,14 +553,9 @@ class Renderer:
 
         self.page.draw_rect(fitz.Rect(x0, top, x1, bottom), fill=self.theme.bg_hunk, color=None, fill_opacity=0.9)
         self.page.insert_text((x0 + pad_x, self.y_base), header, fontname=self.mono_font, fontsize=fs, color=self.theme.tx_hunk)
-
-        # small gap to code (kept minimal as requested)
         self.y_base = bottom + self.layout.gap_hunk_to_code + fs
 
-    # ---- Measurements (keep-together) ----
-
     def measure_hunk_height_unified(self, hunk: Hunk, hide_context: bool) -> float:
-        """Height of one hunk (header + optional suffix + wrapped lines + small block gap)."""
         assert self.page is not None
         x0, y0, x1, y1 = self.box(self.page)
         fs = self.layout.font_size
@@ -597,7 +566,7 @@ class Renderer:
         max_w = max(12.0, x1 - (x0 + gutter_w + self.layout.gutter_gap))
 
         total = 0.0
-        total += line_h + self.layout.gap_hunk_to_code  # header + small gap
+        total += line_h + self.layout.gap_hunk_to_code
         if hunk.suffix:
             parts = wrap_text(hunk.suffix, max_w, self.mono_font, fs)
             total += len(parts) * line_h
@@ -610,7 +579,6 @@ class Renderer:
         return total
 
     def measure_file_height_unified(self, diff_file: DiffFile, hide_context: bool) -> float:
-        """Height of an entire file in unified view (badge + hunks)."""
         assert self.page is not None
         x0, y0, x1, y1 = self.box(self.page)
         fs = self.layout.font_size
@@ -621,7 +589,7 @@ class Renderer:
         max_w = max(12.0, x1 - (x0 + gutter_w + self.layout.gutter_gap))
 
         total = 0.0
-        total += line_h + self.layout.gap_badge_to_hunk  # file badge
+        total += line_h + self.layout.gap_badge_to_hunk
         for h in diff_file.hunks:
             total += line_h + self.layout.gap_hunk_to_code
             if h.suffix:
@@ -636,34 +604,28 @@ class Renderer:
         total += self.layout.block_gap_y
         return total
 
-    # ---- Unified rendering ----
-
     def render_file_unified(self, diff_file: DiffFile, title: str, hide_context: bool):
         self.start_if_needed(title)
         assert self.page is not None and self.y_base is not None
 
-        # Keep-together per FILE
         required = self.measure_file_height_unified(diff_file, hide_context)
         capacity = self.page_capacity()
         if required <= capacity and required > self.space_left():
-            self.ensure_y(10_000)  # break before file
+            self.ensure_y(10_000)
 
         x0, y0, x1, y1 = self.box(self.page)
         fs = self.layout.font_size
         line_h = fs + self.layout.line_gap
 
-        # gutter and text X
         sample = f"{'9' * self.layout.gutter_chars} "
         gutter_w = text_width(sample, self.mono_font, fs)
         text_x = x0 + gutter_w + self.layout.gutter_gap
 
-        # file badge
         label = diff_file.new_path or diff_file.old_path or "(Unnamed)"
         self.ensure_y(line_h)
         self.draw_file_badge(label)
 
         for h in diff_file.hunks:
-            # Keep-together per HUNK
             h_req = self.measure_hunk_height_unified(h, hide_context)
             fresh_capacity = self.page_capacity()
             if h_req > self.space_left() and h_req <= fresh_capacity:
@@ -673,9 +635,7 @@ class Renderer:
             self.ensure_y(line_h)
             self.draw_hunk_header(h.header)
 
-            # Render hunk suffix (e.g., "services:") as added green line without line number
             if h.suffix:
-                # recalc geometry
                 x0, y0, x1, y1 = self.box(self.page)
                 sample = f"{'9' * self.layout.gutter_chars} "
                 gutter_w = text_width(sample, self.mono_font, fs)
@@ -694,7 +654,6 @@ class Renderer:
                     self.page.insert_text((text_x, self.y_base), part, fontname=self.mono_font, fontsize=fs, color=self.theme.tx_added)
                     self.y_base += line_h
 
-            # Render lines
             for dl in h.lines:
                 if hide_context and dl.kind == "ctx":
                     continue
@@ -734,16 +693,11 @@ class Renderer:
 
                     self.y_base += line_h
 
-            # small block gap after hunk
             self.y_base += self.layout.block_gap_y
 
-        # additional small gap after file
         self.y_base += self.layout.block_gap_y
 
-    # ---- Side-by-Side (optional) ----
-
     def render_file_sbs(self, diff_file: DiffFile, title: str):
-        # Continuous flow (keep-together could be added similarly if needed)
         self.start_if_needed(title)
         assert self.page is not None and self.y_base is not None
 
@@ -769,11 +723,6 @@ class Renderer:
             self.ensure_y(line_h)
             self.draw_hunk_header(h.header)
 
-            # Render suffix as green line on right side only (optional). For now, keep unified behavior only.
-            if h.suffix:
-                # you can render suffix on both or right only; skipped here to keep SxS clean
-                pass
-
             i = 0
             while i < len(h.lines):
                 left: Optional[DiffLine] = None
@@ -798,7 +747,6 @@ class Renderer:
                 rows_h = rows * line_h
                 self.ensure_y(rows_h)
 
-                # recalc geometry on new page
                 x0, y0, x1, y1 = self.box(self.page)
                 left_x0 = x0; left_x1 = x0 + col_w
                 right_x0 = left_x1 + gap; right_x1 = x1
@@ -838,19 +786,250 @@ class Renderer:
 
         self.y_base += self.layout.block_gap_y
 
-    # ---- Save ----
-
     def save(self, output_path: str):
         self.draw_footer_page_numbers()
         self.doc.save(output_path)
         self.doc.close()
 
 
+# -------------------- Word Renderer --------------------
+
+def _rgb_to_hex(rgb_tuple: Tuple[float, float, float]) -> str:
+    """Convert a (0..1, 0..1, 0..1) tuple to a 6-digit hex string (no '#')."""
+    r, g, b = rgb_tuple
+    return "{:02X}{:02X}{:02X}".format(int(r * 255), int(g * 255), int(b * 255))
+
+
+def render_word(
+    all_files: List[DiffFile],
+    title: str,
+    output_path: str,
+    theme: Theme,
+    hide_context: bool,
+    view: str,
+    font_size_pt: float = 9.5,
+):
+    try:
+        from docx import Document
+        from docx.shared import Pt, RGBColor, Inches
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+    except ImportError:
+        print(
+            "[ERROR] python-docx is not installed. Run: pip install python-docx",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    def hex_color(rgb_tuple: Tuple[float, float, float]) -> str:
+        return _rgb_to_hex(rgb_tuple)
+
+    def set_cell_bg(cell, hex_str: str):
+        """Set table cell background colour via XML shading."""
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), hex_str)
+        tcPr.append(shd)
+
+    def remove_table_borders(table):
+        """Remove all borders from every cell in a table."""
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        # Table-level border removal
+        tbl = table._tbl
+        tblPr = tbl.find(qn("w:tblPr"))
+        if tblPr is None:
+            tblPr = OxmlElement("w:tblPr")
+            tbl.insert(0, tblPr)
+        tblBorders = tblPr.find(qn("w:tblBorders"))
+        if tblBorders is None:
+            tblBorders = OxmlElement("w:tblBorders")
+            tblPr.append(tblBorders)
+        for border_name in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            border = OxmlElement(f"w:{border_name}")
+            border.set(qn("w:val"), "none")
+            border.set(qn("w:sz"), "0")
+            border.set(qn("w:space"), "0")
+            border.set(qn("w:color"), "auto")
+            tblBorders.append(border)
+        # Cell-level border removal (overrides any cell style)
+        for row in table.rows:
+            for cell in row.cells:
+                tc = cell._tc
+                tcPr = tc.get_or_add_tcPr()
+                tcBorders = tcPr.find(qn("w:tcBorders"))
+                if tcBorders is None:
+                    tcBorders = OxmlElement("w:tcBorders")
+                    tcPr.append(tcBorders)
+                for border_name in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                    border = OxmlElement(f"w:{border_name}")
+                    border.set(qn("w:val"), "none")
+                    border.set(qn("w:sz"), "0")
+                    border.set(qn("w:space"), "0")
+                    border.set(qn("w:color"), "auto")
+                    tcBorders.append(border)
+
+    def add_colored_paragraph(doc, text: str, bg_hex: str, fg_rgb, bold: bool = False, mono: bool = True, indent_pt: float = 0):
+        """Add a single-row, single-cell table acting as a highlighted paragraph."""
+        table = doc.add_table(rows=1, cols=1)
+        table.style = "Table Grid"
+        remove_table_borders(table)
+        cell = table.cell(0, 0)
+        set_cell_bg(cell, bg_hex)
+
+        para = cell.paragraphs[0]
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after = Pt(0)
+        if indent_pt:
+            para.paragraph_format.left_indent = Pt(indent_pt)
+        run = para.add_run(text)
+        run.font.name = "Consolas" if mono else "Calibri"
+        run.font.size = Pt(font_size_pt)
+        run.font.bold = bold
+        run.font.color.rgb = RGBColor(
+            int(fg_rgb[0] * 255),
+            int(fg_rgb[1] * 255),
+            int(fg_rgb[2] * 255),
+        )
+        return table
+
+    doc = Document()
+
+    # Page margins
+    for section in doc.sections:
+        section.top_margin = Inches(0.6)
+        section.bottom_margin = Inches(0.6)
+        section.left_margin = Inches(0.7)
+        section.right_margin = Inches(0.7)
+
+    # Document title heading
+    heading = doc.add_heading(title, level=1)
+    heading.runs[0].font.color.rgb = RGBColor(40, 40, 40)
+    stamp_para = doc.add_paragraph(dt.datetime.now().strftime("Generated: %Y-%m-%d %H:%M"))
+    stamp_para.runs[0].font.size = Pt(font_size_pt - 1)
+    stamp_para.runs[0].font.color.rgb = RGBColor(125, 125, 125)
+    doc.add_paragraph("")  # spacer
+
+    bg_add_hex = hex_color(theme.bg_added)
+    bg_del_hex = hex_color(theme.bg_removed)
+    bg_ctx_hex = hex_color(theme.bg_context)
+    bg_hunk_hex = hex_color(theme.bg_hunk)
+
+    for diff_file in all_files:
+        label = diff_file.new_path or diff_file.old_path or "(Unnamed)"
+
+        # --- File badge ---
+        add_colored_paragraph(
+            doc, label, bg_hunk_hex, theme.tx_hunk, bold=True, mono=False
+        )
+
+        for h in diff_file.hunks:
+            # --- Hunk header ---
+            add_colored_paragraph(
+                doc, h.header, bg_hunk_hex, theme.tx_hunk, bold=False, mono=True
+            )
+
+            # --- Hunk suffix (rendered as added line) ---
+            if h.suffix:
+                add_colored_paragraph(
+                    doc, h.suffix, bg_add_hex, theme.tx_added, bold=False, mono=True
+                )
+
+            # --- Diff lines ---
+            if view == "side-by-side":
+                i = 0
+                while i < len(h.lines):
+                    left: Optional[DiffLine] = None
+                    right: Optional[DiffLine] = None
+                    ln = h.lines[i]
+                    if ln.kind == "del":
+                        if i + 1 < len(h.lines) and h.lines[i + 1].kind == "add":
+                            left = ln; right = h.lines[i + 1]; i += 2
+                        else:
+                            left = ln; i += 1
+                    elif ln.kind == "add":
+                        right = ln; i += 1
+                    else:
+                        left = ln; right = ln; i += 1
+
+                    tbl = doc.add_table(rows=1, cols=2)
+                    tbl.style = "Table Grid"
+                    remove_table_borders(tbl)
+                    l_cell = tbl.cell(0, 0)
+                    r_cell = tbl.cell(0, 1)
+
+                    if left and left.kind == "del":
+                        set_cell_bg(l_cell, bg_del_hex)
+                    else:
+                        set_cell_bg(l_cell, bg_ctx_hex)
+
+                    if right and right.kind == "add":
+                        set_cell_bg(r_cell, bg_add_hex)
+                    else:
+                        set_cell_bg(r_cell, bg_ctx_hex)
+
+                    def _fill_cell(cell, dl: Optional[DiffLine], side: str):
+                        para = cell.paragraphs[0]
+                        para.paragraph_format.space_before = Pt(0)
+                        para.paragraph_format.space_after = Pt(0)
+                        if dl is None:
+                            return
+                        num = dl.old_num if side == "left" else dl.new_num
+                        num_str = f"{num:>5d}  " if num is not None else "        "
+                        run_num = para.add_run(num_str)
+                        run_num.font.name = "Consolas"
+                        run_num.font.size = Pt(font_size_pt)
+                        run_num.font.color.rgb = RGBColor(125, 125, 125)
+
+                        fg = (
+                            theme.tx_removed if dl.kind == "del"
+                            else theme.tx_added if dl.kind == "add"
+                            else theme.tx_context
+                        )
+                        run_txt = para.add_run(dl.text)
+                        run_txt.font.name = "Consolas"
+                        run_txt.font.size = Pt(font_size_pt)
+                        run_txt.font.color.rgb = RGBColor(
+                            int(fg[0] * 255), int(fg[1] * 255), int(fg[2] * 255)
+                        )
+
+                    _fill_cell(l_cell, left, "left")
+                    _fill_cell(r_cell, right, "right")
+
+            else:
+                # Unified view
+                for dl in h.lines:
+                    if hide_context and dl.kind == "ctx":
+                        continue
+                    bg_hex = bg_add_hex if dl.kind == "add" else (bg_del_hex if dl.kind == "del" else bg_ctx_hex)
+                    fg = (
+                        theme.tx_added if dl.kind == "add"
+                        else theme.tx_removed if dl.kind == "del"
+                        else theme.tx_context
+                    )
+                    num = dl.new_num if dl.kind == "add" else dl.old_num
+                    num_str = f"{num:>5d}  " if num is not None else "        "
+                    line_text = num_str + dl.text
+
+                    add_colored_paragraph(
+                        doc, line_text, bg_hex, fg, bold=False, mono=True
+                    )
+
+        doc.add_paragraph("")  # spacer between files
+
+    doc.save(output_path)
+    print(f"✓ Word document created: {output_path}")
+
+
 # -------------------- CLI / Main --------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PR-like PDF from unified git diffs (Unified or Side-by-Side).",
+        description="PR-like PDF (and optionally Word .docx) from unified git diffs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("inputs", nargs="+", help="Diff file(s) or '-' for STDIN")
@@ -863,6 +1042,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tabsize", type=int, default=4, help="Tab width for expansion")
     p.add_argument("--theme", choices=["light", "dark"], default="light", help="Color theme")
     p.add_argument("--debug", action="store_true", help="Parser debug output (stderr)")
+    p.add_argument("--word", action="store_true", help="Also generate a Word (.docx) file alongside the PDF")
+    p.add_argument("--word-output", default=None, metavar="FILE.docx",
+                   help="Custom path for the Word output (default: same base name as --output with .docx)")
     # Optional font overrides
     p.add_argument("--mono-font-file", default=None, help="TTF/OTF monospace (e.g., Consolas)")
     p.add_argument("--mono-bold-font-file", default=None, help="TTF/OTF monospace bold")
@@ -905,7 +1087,7 @@ def main():
         print("  • Not supported: `--word-diff`, `--name-only`, `--name-status`", file=sys.stderr)
         sys.exit(2)
 
-    # Render per file
+    # Render PDF
     for df in all_files:
         if args.view == "unified":
             renderer.render_file_unified(df, title=args.title, hide_context=args.hide_context)
@@ -913,7 +1095,22 @@ def main():
             renderer.render_file_sbs(df, title=args.title)
 
     renderer.save(args.output)
-    print(f"✓ PDF created: {args.output}")
+
+    # Render Word (optional)
+    if args.word or args.word_output:
+        word_path = args.word_output
+        if not word_path:
+            base, _ = os.path.splitext(args.output)
+            word_path = base + ".docx"
+        render_word(
+            all_files=all_files,
+            title=args.title,
+            output_path=word_path,
+            theme=theme,
+            hide_context=args.hide_context,
+            view=args.view,
+            font_size_pt=args.font_size,
+        )
 
 
 if __name__ == "__main__":
